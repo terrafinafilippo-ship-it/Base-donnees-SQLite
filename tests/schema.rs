@@ -12,6 +12,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "raw_wallet_flow",
     "raw_launch_participant",
     "token_outcome",
+    "trade_outcome",
     "cluster",
     "cluster_member",
     "cluster_profile",
@@ -105,6 +106,47 @@ fn unique_constraint_rejects_duplicate() {
     insert().expect("premier insert doit réussir");
     // UNIQUE(mint, label, observed_slot) : le doublon exact doit échouer.
     assert!(insert().is_err(), "le second insert identique doit échouer");
+}
+
+#[test]
+fn trade_outcome_survives_reset_recomputable() {
+    let (_dir, path) = temp_db();
+    let conn = db::init(&path).expect("init");
+
+    // trade_outcome est FACT-LIKE : un trade exécuté est un fait irréversible,
+    // reset_recomputable ne doit PAS le toucher.
+    conn.execute(
+        "INSERT INTO trade_outcome \
+         (mint, cluster_id, prediction_id, action, reason, amount_sol, pnl_lamports, bot_slot, ingested_unix_ms) \
+         VALUES ('mintT', 7, 42, 'buy', NULL, 1000000000, 250000000, 999, 1700000000000);",
+        [],
+    )
+    .expect("insert trade_outcome");
+
+    db::reset_recomputable(&conn).expect("reset_recomputable");
+
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM trade_outcome;", [], |r| r.get(0))
+        .expect("count trade_outcome");
+    assert_eq!(count, 1, "la ligne trade_outcome doit subsister (fact-like)");
+}
+
+#[test]
+fn trade_outcome_strict_mode_rejects_wrong_type() {
+    let (_dir, path) = temp_db();
+    let conn = db::init(&path).expect("init");
+
+    // bot_slot est INTEGER NOT NULL en table STRICT : un TEXT non numérique doit
+    // ÉCHOUER (pas de coercition silencieuse).
+    let res = conn.execute(
+        "INSERT INTO trade_outcome (mint, action, bot_slot, ingested_unix_ms) \
+         VALUES ('mintT', 'buy', 'pas_un_entier', 1700000000000);",
+        [],
+    );
+    assert!(
+        res.is_err(),
+        "STRICT doit rejeter un TEXT dans la colonne INTEGER bot_slot"
+    );
 }
 
 #[test]

@@ -48,6 +48,25 @@ CREATE TABLE IF NOT EXISTS token_outcome (
 ) STRICT;
 -- Maturité non stockée : 'alive' dérivé = aucun label terminal final=1 ET âge >= 24h.
 
+-- trade_outcome : actions exécutées par le bot de snipe, ingérées en batch depuis
+-- le journal append-only (fichier séparé, HORS de cette base). FACT-LIKE : un trade
+-- est un fait irréversible et non réobservable (pas de backfill), du même côté que
+-- token_outcome. Jamais droppée/vidée par reset_recomputable, jamais versionnée par
+-- method_version. Rapprochée de score_prediction (prédit) pour mesurer l'écart
+-- prédit/réalisé.
+CREATE TABLE IF NOT EXISTS trade_outcome (
+    id               INTEGER PRIMARY KEY,
+    mint             TEXT NOT NULL,
+    cluster_id       INTEGER,            -- profil jugé au moment de l'action (nullable)
+    prediction_id    INTEGER,            -- lien vers score_prediction.id : prédit vs réalisé (nullable)
+    action           TEXT NOT NULL,      -- 'buy'|'sell'|'skip'|'blocked'
+    reason           TEXT,               -- ex. 'honeypot_check_failed','slippage_exceeded' (nullable)
+    amount_sol       INTEGER,            -- lamports engagés (nullable si skip/blocked)
+    pnl_lamports     INTEGER,            -- résultat réalisé ; NULL si position ouverte ou non exécuté
+    bot_slot         INTEGER NOT NULL,   -- slot de l'action côté bot
+    ingested_unix_ms INTEGER NOT NULL    -- quand l'analyseur l'a avalé du journal
+) STRICT;
+
 -- ===== DÉRIVÉ RECALCULABLE — droppé/recréé par reset_recomputable. =====
 
 CREATE TABLE IF NOT EXISTS cluster (
