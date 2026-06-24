@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+
+# Bases SQLite locales et artefacts WAL (jamais committés).
+*.db
+*.db-wal
+*.db-shm

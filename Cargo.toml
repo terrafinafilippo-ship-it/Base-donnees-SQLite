@@ -1,0 +1,18 @@
+[package]
+name = "solana-memecoin-db"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0 : couche de persistance SQLite (schéma + application) pour le système d'intelligence de sniping de memecoins Solana."
+
+[lib]
+name = "solana_memecoin_db"
+path = "src/lib.rs"
+
+[dependencies]
+# rusqlite synchrone (PAS sqlx). Feature `bundled` = SQLite compilé en statique,
+# garantit le support du mode STRICT (SQLite >= 3.37) indépendamment du système.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+# Bases temporaires isolées pour les tests d'intégration.
+tempfile = "3"
