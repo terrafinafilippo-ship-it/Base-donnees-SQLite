@@ -1,12 +1,12 @@
 //! Test d'intégration de la couche de persistance (Phase 0).
 //!
-//! Couvre : intégrité, présence des 9 tables, mode WAL, mode STRICT,
+//! Couvre : intégrité, présence des 11 tables, mode WAL, mode STRICT,
 //! déduplication via contraintes UNIQUE/PRIMARY KEY, et frontière de DROP de
 //! `reset_recomputable`.
 
 use solana_memecoin_db::db;
 
-/// Les 9 tables attendues dans le schéma.
+/// Les 11 tables attendues dans le schéma.
 const EXPECTED_TABLES: &[&str] = &[
     "raw_token_launch",
     "raw_wallet_flow",
@@ -47,7 +47,7 @@ fn init_creates_valid_schema() {
         .expect("journal_mode");
     assert_eq!(journal.to_lowercase(), "wal", "journal_mode doit être wal");
 
-    // Les 10 tables existent (9 « groupes » du schéma + analysis_queue).
+    // Les 11 tables du schéma existent.
     for table in EXPECTED_TABLES {
         let count: i64 = conn
             .query_row(
@@ -150,11 +150,31 @@ fn trade_outcome_strict_mode_rejects_wrong_type() {
 }
 
 #[test]
+fn all_tables_are_strict() {
+    let (_dir, path) = temp_db();
+    let conn = db::init(&path).expect("init");
+
+    // Introspection via PRAGMA table_list : la colonne `strict` vaut 1 pour une
+    // table déclarée STRICT. Le test échoue si UNE SEULE des 11 tables perdait
+    // ce mode (ou disparaissait).
+    for table in EXPECTED_TABLES {
+        let strict: i64 = conn
+            .query_row(
+                "SELECT strict FROM pragma_table_list WHERE name = ?1;",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("table_list pour {table} : {e}"));
+        assert_eq!(strict, 1, "la table {table} doit être en mode STRICT");
+    }
+}
+
+#[test]
 fn reset_recomputable_respects_drop_frontier() {
     let (_dir, path) = temp_db();
     let conn = db::init(&path).expect("init");
 
-    // Données « jamais droppées » (raw + fact-like).
+    // ===== Côté « jamais droppé » : on remplit TOUTES ces tables. =====
     conn.execute(
         "INSERT INTO raw_token_launch \
          (mint, deployer, program, slot, seen_unix_ms, launch_sig) \
@@ -163,26 +183,69 @@ fn reset_recomputable_respects_drop_frontier() {
     )
     .expect("insert raw_token_launch");
     conn.execute(
+        "INSERT INTO raw_wallet_flow (sig, slot, src, dst, mint, amount, kind) \
+         VALUES ('sigF', 2, 'srcW', 'dstW', 'mintR', 1000, 'transfer');",
+        [],
+    )
+    .expect("insert raw_wallet_flow");
+    conn.execute(
+        "INSERT INTO raw_launch_participant (mint, wallet, slot, amount, is_signer) \
+         VALUES ('mintR', 'walletP', 3, 500, 1);",
+        [],
+    )
+    .expect("insert raw_launch_participant");
+    conn.execute(
         "INSERT INTO token_outcome (mint, label, label_class, observed_slot) \
          VALUES ('mintR', 'price_zero', 'terminal', 10);",
         [],
     )
     .expect("insert token_outcome");
+    conn.execute(
+        "INSERT INTO trade_outcome (mint, action, bot_slot, ingested_unix_ms) \
+         VALUES ('mintR', 'buy', 11, 1700000000001);",
+        [],
+    )
+    .expect("insert trade_outcome");
+    conn.execute(
+        "INSERT INTO analysis_queue (entity, entity_kind, enqueued_slot, updated_unix_ms) \
+         VALUES ('dep', 'deployer', 4, 1700000000002);",
+        [],
+    )
+    .expect("insert analysis_queue");
+    // passthrough_node 'seed' = denylist permanente, ne doit pas être purgée.
+    conn.execute(
+        "INSERT INTO passthrough_node (address, source) VALUES ('seed_addr', 'seed');",
+        [],
+    )
+    .expect("insert passthrough seed");
 
-    // Donnée recalculable : sera droppée/recréée (donc vidée).
+    // ===== Côté « recalculable » : on remplit TOUTES ces tables. =====
     conn.execute(
         "INSERT INTO cluster (anchor_wallet, method_version, updated_slot) \
          VALUES ('anchor', 1, 5);",
         [],
     )
     .expect("insert cluster");
-
-    // passthrough_node : une 'seed' (permanente) et une 'auto' (purgée).
     conn.execute(
-        "INSERT INTO passthrough_node (address, source) VALUES ('seed_addr', 'seed');",
+        "INSERT INTO cluster_member (cluster_id, wallet, link_type, link_strength) \
+         VALUES (1, 'walletM', 'funding', 0.9);",
         [],
     )
-    .expect("insert passthrough seed");
+    .expect("insert cluster_member");
+    conn.execute(
+        "INSERT INTO cluster_profile (cluster_id, beta_alpha, beta_beta) \
+         VALUES (1, 1.0, 1.0);",
+        [],
+    )
+    .expect("insert cluster_profile");
+    conn.execute(
+        "INSERT INTO score_prediction \
+         (cluster_id, mint, risk, confidence, method_version, predicted_slot) \
+         VALUES (1, 'mintR', 0.5, 0.5, 1, 6);",
+        [],
+    )
+    .expect("insert score_prediction");
+    // passthrough_node 'auto' = détectée, doit être purgée.
     conn.execute(
         "INSERT INTO passthrough_node (address, source) VALUES ('auto_addr', 'auto');",
         [],
@@ -195,17 +258,24 @@ fn reset_recomputable_respects_drop_frontier() {
         conn.query_row(sql, [], |r| r.get(0)).expect("count")
     };
 
-    // SUBSISTENT.
+    // ===== DOIVENT SUBSISTER (comptes exacts). =====
     assert_eq!(count("SELECT count(*) FROM raw_token_launch;"), 1, "raw_token_launch doit subsister");
+    assert_eq!(count("SELECT count(*) FROM raw_wallet_flow;"), 1, "raw_wallet_flow doit subsister");
+    assert_eq!(count("SELECT count(*) FROM raw_launch_participant;"), 1, "raw_launch_participant doit subsister");
     assert_eq!(count("SELECT count(*) FROM token_outcome;"), 1, "token_outcome doit subsister");
+    assert_eq!(count("SELECT count(*) FROM trade_outcome;"), 1, "trade_outcome doit subsister");
+    assert_eq!(count("SELECT count(*) FROM analysis_queue;"), 1, "analysis_queue ne doit JAMAIS être droppée");
     assert_eq!(
         count("SELECT count(*) FROM passthrough_node WHERE source='seed';"),
         1,
         "la ligne passthrough 'seed' doit subsister"
     );
 
-    // DISPARAISSENT.
-    assert_eq!(count("SELECT count(*) FROM cluster;"), 0, "la table cluster doit être vidée");
+    // ===== DOIVENT ÊTRE VIDÉES (comptes exacts). =====
+    assert_eq!(count("SELECT count(*) FROM cluster;"), 0, "cluster doit être vidée");
+    assert_eq!(count("SELECT count(*) FROM cluster_member;"), 0, "cluster_member doit être vidée");
+    assert_eq!(count("SELECT count(*) FROM cluster_profile;"), 0, "cluster_profile doit être vidée");
+    assert_eq!(count("SELECT count(*) FROM score_prediction;"), 0, "score_prediction doit être vidée");
     assert_eq!(
         count("SELECT count(*) FROM passthrough_node WHERE source='auto';"),
         0,
