@@ -14,6 +14,13 @@ use rusqlite::{Connection, Result};
 /// `schema.sql` (single source of truth), aucun chemin n'est résolu à l'exécution.
 const SCHEMA_SQL: &str = include_str!("../../db/schema.sql");
 
+/// Contenu de `db/seed_passthrough.sql`, embarqué à la compilation.
+///
+/// Même principe que [`SCHEMA_SQL`] : les adresses de la denylist permanente
+/// vivent UNIQUEMENT dans le `.sql` (source de vérité), jamais en dur dans le
+/// Rust. Appliqué par [`init`] après le schéma.
+const SEED_SQL: &str = include_str!("../../db/seed_passthrough.sql");
+
 /// Tables dérivées RECALCULABLES, droppées puis recréées par
 /// [`reset_recomputable`]. L'ordre n'a pas d'importance : aucune clé étrangère
 /// dans le schéma (décision verrouillée).
@@ -63,6 +70,12 @@ pub fn init(path: &str) -> Result<Connection> {
     // `schema.sql` contient lui-même les PRAGMAs en tête ; les réappliquer via
     // execute_batch est inoffensif et idempotent.
     conn.execute_batch(SCHEMA_SQL)?;
+    // Seeding de la denylist passthrough, APRÈS le schéma : `SEED_SQL` insère
+    // dans `passthrough_node`, qui doit donc déjà exister. Idempotent : chaque
+    // ligne est un `INSERT OR IGNORE` sur la PK `address`, donc rappeler `init`
+    // ne crée aucun doublon. Les lignes posées sont `source='seed'` (permanentes,
+    // jamais purgées par `reset_recomputable`).
+    conn.execute_batch(SEED_SQL)?;
     Ok(conn)
 }
 
