@@ -2,7 +2,7 @@
 name = "solana-memecoin-db"
 version = "0.1.0"
 edition = "2021"
-description = "Phase 0 : couche de persistance SQLite (schéma + application) pour le système d'intelligence de sniping de memecoins Solana."
+description = "Persistance SQLite + ingestor + analyseur pour le système d'intelligence de sniping de memecoins Solana."
 
 [lib]
 name = "solana_memecoin_db"
