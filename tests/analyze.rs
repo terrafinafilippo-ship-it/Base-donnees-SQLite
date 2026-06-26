@@ -179,30 +179,130 @@ fn run_once_builds_cluster_profile_and_predictions() {
 
 #[test]
 fn member_link_types_reflect_strongest_signal() {
+    // Lot 1 : seuls les flux fondent l'appartenance, les types émis sont
+    // exclusivement 'funding' et 'consolidation'.
+    //
+    // Avant Lot 1, W1 (co-participant sans flux propre) devenait "exclusivity".
+    // Après Lot 1, W1 entre via le flux D→W1 (funding) ; la co-participation
+    // lui confère un bonus de force mais ne change pas son type fondateur.
+    // W2 reste "consolidation" (prio 2 > prio 1 à force égale, puis boost corroboratif).
     let (_d, conn) = temp_db();
     build_scenario(&conn);
     analyze::run_once(&conn).unwrap();
     let cid = cluster_id(&conn, "D");
 
-    // W1 ne participe qu'aux tokens de D => exclusivity (prioritaire).
-    let w1: String = conn
+    // W1 : flux D→W1 (funding) → type fondateur 'funding'. L'ancien type
+    // 'exclusivity' est supprimé (invariant Lot 1).
+    let w1_type: String = conn
         .query_row(
             "SELECT link_type FROM cluster_member WHERE cluster_id = ? AND wallet = 'W1'",
             [cid],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(w1, "exclusivity");
+    assert_eq!(w1_type, "funding", "W1 entre via flux D→W1 : type fondateur = funding");
 
-    // W2 : funding et consolidation à force égale => consolidation gagne (priorité).
-    let w2: String = conn
+    // W2 : flux funding (D→W2) et consolidation (W2→D) à force égale
+    // => consolidation gagne (priorité 2 > 1). Type fondateur conservé.
+    let w2_type: String = conn
         .query_row(
             "SELECT link_type FROM cluster_member WHERE cluster_id = ? AND wallet = 'W2'",
             [cid],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(w2, "consolidation");
+    assert_eq!(w2_type, "consolidation");
+}
+
+#[test]
+fn coparticipant_without_flow_is_not_a_member() {
+    // Invariant verrouillé Lot 1 : un wallet co-participant à TOUS les mints
+    // du deployer mais sans aucun flux de fonds vers/depuis ce deployer NE DOIT
+    // PAS apparaître dans cluster_member.
+    let (_d, conn) = temp_db();
+    launch(&conn, "M1", "D", 10);
+    launch(&conn, "M2", "D", 20);
+    // W co-participe aux deux tokens de D, aucun flux D↔W.
+    participant(&conn, "M1", "W", 10);
+    participant(&conn, "M2", "W", 20);
+
+    analyze::run_once(&conn).unwrap();
+    let cid = cluster_id(&conn, "D");
+
+    let w_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cluster_member WHERE cluster_id = ? AND wallet = 'W'",
+            [cid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(w_count, 0, "co-participation seule ne fonde pas l'appartenance");
+}
+
+#[test]
+fn cobehavior_boosts_existing_member_strength() {
+    // Un wallet avec un flux 'funding' ET une co-participation doit avoir une
+    // force strictement supérieure à un wallet avec le même flux mais sans
+    // co-participation, dans la limite de COBEHAVIOR_STRENGTH_CAP. Le type
+    // fondateur 'funding' doit être conservé.
+    let (_d, conn) = temp_db();
+    launch(&conn, "M1", "D", 10);
+    launch(&conn, "M2", "D", 20);
+
+    // W1 : 1 flux funding + co-participation aux 2 mints (share = 1.0).
+    flow(&conn, "f1", "D", "W1", 11);
+    participant(&conn, "M1", "W1", 10);
+    participant(&conn, "M2", "W1", 20);
+
+    // W2 : 1 flux funding identique, aucune co-participation.
+    flow(&conn, "f2", "D", "W2", 12);
+
+    analyze::run_once(&conn).unwrap();
+    let cid = cluster_id(&conn, "D");
+
+    let (w1_type, w1_str): (String, f64) = conn
+        .query_row(
+            "SELECT link_type, link_strength FROM cluster_member WHERE cluster_id = ? AND wallet = 'W1'",
+            [cid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let w2_str: f64 = conn
+        .query_row(
+            "SELECT link_strength FROM cluster_member WHERE cluster_id = ? AND wallet = 'W2'",
+            [cid],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(w1_type, "funding", "le type fondateur est conservé après boost corroboratif");
+    assert!(
+        w1_str > w2_str,
+        "la co-participation renforce la force : W1={w1_str} doit être > W2={w2_str}"
+    );
+    assert!(
+        w1_str <= analyze::COBEHAVIOR_STRENGTH_CAP,
+        "la force est plafonnée à COBEHAVIOR_STRENGTH_CAP : {w1_str}"
+    );
+}
+
+#[test]
+fn no_member_has_exclusivity_or_cobehavior_link_type() {
+    // Après un run complet, aucune ligne de cluster_member ne doit porter
+    // link_type 'exclusivity' ou 'cobehavior' : ces valeurs ne sont plus
+    // produites depuis Lot 1.
+    let (_d, conn) = temp_db();
+    build_scenario(&conn);
+    analyze::run_once(&conn).unwrap();
+
+    let bad: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cluster_member WHERE link_type IN ('exclusivity', 'cobehavior')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bad, 0, "aucun membre ne doit porter les types obsolètes");
 }
 
 #[test]

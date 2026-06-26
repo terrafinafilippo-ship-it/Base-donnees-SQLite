@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Version de la méthode de clustering/scoring. À incrémenter quand l'algorithme
 /// change, pour distinguer les `cluster`/`score_prediction` d'époques différentes.
-pub const METHOD_VERSION: i64 = 1;
+pub const METHOD_VERSION: i64 = 2;
 
 // --- Réglages du modèle (valeurs par défaut Phase 1, à calibrer sur données). ---
 
@@ -40,6 +40,13 @@ const MIN_SAMPLES_FOR_RUGGER: i64 = 3;
 /// passthrough. Le double critère sépare un hub (relais) d'un simple wallet de
 /// consolidation (fort fan-in, faible fan-out).
 const PASSTHROUGH_MIN_DEGREE: i64 = 6;
+/// Bonus corroboratif maximal ajouté à la force d'un lien fondateur lorsqu'une
+/// co-participation le confirme : bonus_réel = COBEHAVIOR_BONUS_MAX × share,
+/// où share = (mints co-participés) / (total mints du deployer). À calibrer.
+pub const COBEHAVIOR_BONUS_MAX: f64 = 0.1;
+/// Plafond de `link_strength` après boost corroboratif : la force reste < 1 même
+/// avec un très grand nombre de confirmations. À calibrer.
+pub const COBEHAVIOR_STRENGTH_CAP: f64 = 0.99;
 
 /// Bilan d'un tick d'analyse.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -296,12 +303,19 @@ fn saturating_strength(n: i64) -> f64 {
     n / (n + 1.0)
 }
 
-/// Construit les membres du cluster ancré sur `deployer`, en croisant quatre
-/// signaux. Le PK `(cluster_id, wallet)` n'autorise qu'UN lien par wallet : on
-/// retient le plus fort (départage par priorité de type).
+/// Construit les membres du cluster ancré sur `deployer`.
 ///
-/// Priorités (départage à force égale) : exclusivity > consolidation > funding >
-/// cobehavior.
+/// PHASE A — fondatrice : seuls les flux de fonds créent l'appartenance.
+/// - `funding` : deployer → wallet (priorité 1)
+/// - `consolidation` : wallet → deployer (priorité 2)
+///
+/// Un seul lien par wallet, le plus fort (départage par priorité à force égale).
+///
+/// PHASE B — corroborative : la co-participation dans `raw_launch_participant`
+/// ne peut QUE renforcer la force d'un wallet DÉJÀ membre (via Phase A).
+/// Elle ne crée jamais de nouveau membre et ne change pas le `link_type`
+/// fondateur. Invariant verrouillé : la co-participation seule ne fonde JAMAIS
+/// l'appartenance (évite le mega-cluster collapse).
 fn collect_members(
     conn: &Connection,
     deployer: &str,
@@ -309,53 +323,67 @@ fn collect_members(
 ) -> Result<Vec<(String, &'static str, f64)>> {
     // wallet -> (priorité, force, type)
     let mut best: HashMap<String, (u8, f64, &'static str)> = HashMap::new();
-    let mut consider = |wallet: String, prio: u8, strength: f64, link_type: &'static str| {
-        if wallet == deployer || passthrough.contains(&wallet) {
-            return;
-        }
-        match best.get_mut(&wallet) {
-            Some(e) if strength > e.1 || (strength == e.1 && prio > e.0) => {
-                *e = (prio, strength, link_type);
-            }
-            Some(_) => {}
-            None => {
-                best.insert(wallet, (prio, strength, link_type));
-            }
-        }
-    };
 
-    // funding : deployer -> wallet (le deployer a financé le wallet).
+    // PHASE A : funding + consolidation. La closure `consider` est scopée ici
+    // pour libérer l'emprunt mutable de `best` avant la Phase B.
     {
-        let mut stmt =
-            conn.prepare("SELECT dst, COUNT(*) FROM raw_wallet_flow WHERE src = ? GROUP BY dst")?;
-        let rows = stmt.query_map(params![deployer], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (wallet, c) = row?;
-            consider(wallet, 1, saturating_strength(c), "funding");
-        }
-    }
+        let mut consider = |wallet: String, prio: u8, strength: f64, link_type: &'static str| {
+            if wallet == deployer || passthrough.contains(&wallet) {
+                return;
+            }
+            match best.get_mut(&wallet) {
+                Some(e) if strength > e.1 || (strength == e.1 && prio > e.0) => {
+                    *e = (prio, strength, link_type);
+                }
+                Some(_) => {}
+                None => {
+                    best.insert(wallet, (prio, strength, link_type));
+                }
+            }
+        };
 
-    // consolidation : wallet -> deployer (le wallet renvoie vers le deployer).
-    {
-        let mut stmt =
-            conn.prepare("SELECT src, COUNT(*) FROM raw_wallet_flow WHERE dst = ? GROUP BY src")?;
-        let rows = stmt.query_map(params![deployer], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (wallet, c) = row?;
-            consider(wallet, 2, saturating_strength(c), "consolidation");
+        // funding : deployer -> wallet (le deployer a financé le wallet).
+        {
+            let mut stmt = conn
+                .prepare("SELECT dst, COUNT(*) FROM raw_wallet_flow WHERE src = ? GROUP BY dst")?;
+            let rows = stmt.query_map(params![deployer], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (wallet, c) = row?;
+                consider(wallet, 1, saturating_strength(c), "funding");
+            }
         }
-    }
 
-    // cobehavior / exclusivity : wallets participant aux tokens du deployer.
+        // consolidation : wallet -> deployer (le wallet renvoie vers le deployer).
+        {
+            let mut stmt = conn
+                .prepare("SELECT src, COUNT(*) FROM raw_wallet_flow WHERE dst = ? GROUP BY src")?;
+            let rows = stmt.query_map(params![deployer], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (wallet, c) = row?;
+                consider(wallet, 2, saturating_strength(c), "consolidation");
+            }
+        }
+    } // `consider` droppé ici → emprunt mutable de `best` libéré.
+
+    // PHASE B : bonus corroboratif. Accès direct à `best` (plus de closure).
+    // La co-participation confirme un lien fondateur mais ne l'instaure pas.
+    // Si le wallet n'est pas déjà dans `best`, son entrée est silencieusement
+    // ignorée : seul un flux de fonds fonde l'appartenance.
+    //
+    // TODO Phase 3 : ignorer les launches à très grand nombre de participants
+    // (hot mints publics) pour éviter des bonus corroboratifs parasites.
+    // Non implémenté ici : sans création d'appartenance, le risque mega-cluster
+    // est déjà neutralisé par cette Phase B.
     let anchor_mints: Vec<String> = {
         let mut stmt = conn.prepare("SELECT mint FROM raw_token_launch WHERE deployer = ?")?;
         let rows = stmt.query_map(params![deployer], |r| r.get::<_, String>(0))?;
         rows.collect::<Result<_>>()?
     };
+
     if !anchor_mints.is_empty() {
         let total = anchor_mints.len() as f64;
         let ph = placeholders(anchor_mints.len());
@@ -367,7 +395,6 @@ fn collect_members(
         p.push(deployer);
         p.extend(anchor_mints.iter().map(String::as_str));
 
-        // (wallet, nb_tokens_du_deployer) collecté avant tout autre emprunt de conn.
         let coparticipants: Vec<(String, i64)> = {
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(p.iter()), |r| {
@@ -380,23 +407,11 @@ fn collect_members(
             if wallet == deployer || passthrough.contains(&wallet) {
                 continue;
             }
-            let share = c as f64 / total;
-            // exclusivity : le wallet ne participe à AUCUN mint hors de l'anchor.
-            let outside: i64 = {
-                let sql2 = format!(
-                    "SELECT COUNT(*) FROM raw_launch_participant \
-                     WHERE wallet = ? AND mint NOT IN ({ph})"
-                );
-                let mut p2: Vec<&str> = Vec::with_capacity(1 + anchor_mints.len());
-                p2.push(wallet.as_str());
-                p2.extend(anchor_mints.iter().map(String::as_str));
-                conn.query_row(&sql2, params_from_iter(p2.iter()), |r| r.get(0))?
-            };
-            if outside == 0 {
-                consider(wallet, 3, share.max(0.5), "exclusivity");
-            } else {
-                consider(wallet, 0, share, "cobehavior");
+            if let Some(entry) = best.get_mut(&wallet) {
+                let share = c as f64 / total;
+                entry.1 = (entry.1 + COBEHAVIOR_BONUS_MAX * share).min(COBEHAVIOR_STRENGTH_CAP);
             }
+            // Wallet absent de `best` : co-participation ignorée, jamais fondatrice.
         }
     }
 

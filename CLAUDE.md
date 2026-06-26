@@ -79,10 +79,14 @@ seules sources de vérité.
   (passthrough → enqueue deployers → analyse). Idempotent.
 - `detect_passthrough`, `enqueue_new_deployers`, `analyze_deployer` exposés pour usage ciblé.
 - `METHOD_VERSION` : version de méthode estampillée sur `cluster` / `score_prediction`.
-- Clustering : 4 types de liens (`funding`, `consolidation`, `cobehavior`, `exclusivity`),
-  un seul retenu par wallet (le plus fort). Profil : modèle Beta-Bernoulli du taux de rug
-  (`risk` = moyenne a posteriori, `confidence` croît avec `token_count`). Un rug = un
-  `token_outcome` terminal `final=1`.
+- Clustering (`METHOD_VERSION = 2`) : 2 types **fondateurs** (`funding` = deployer→wallet,
+  `consolidation` = wallet→deployer) tirés uniquement des flux de fonds
+  (`raw_wallet_flow`) — seuls ces liens créent l'appartenance à un cluster. La
+  co-participation (`raw_launch_participant`) est un **bonus corroboratif** borné
+  (`COBEHAVIOR_BONUS_MAX × share`, plafonné à `COBEHAVIOR_STRENGTH_CAP`) qui renforce
+  la force d'un lien déjà fondé, jamais le type ni l'appartenance elle-même. Profil :
+  modèle Beta-Bernoulli du taux de rug (`risk` = moyenne a posteriori, `confidence`
+  croît avec `token_count`). Un rug = un `token_outcome` terminal `final=1`.
 
 ## Schéma — 11 tables, classées par cycle de vie
 
