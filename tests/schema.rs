@@ -328,8 +328,8 @@ fn reset_recomputable_respects_drop_frontier() {
     assert_eq!(count("SELECT count(*) FROM analysis_queue;"), 1, "analysis_queue ne doit JAMAIS être droppée");
     assert_eq!(
         count("SELECT count(*) FROM passthrough_node WHERE source='seed';"),
-        1,
-        "la ligne passthrough 'seed' doit subsister"
+        count_seed_inserts() + 1,
+        "les lignes 'seed' (denylist du fichier + celle insérée ici) doivent toutes subsister"
     );
 
     // ===== DOIVENT ÊTRE VIDÉES (comptes exacts). =====
