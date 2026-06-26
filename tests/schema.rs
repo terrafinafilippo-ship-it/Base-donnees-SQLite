@@ -169,6 +169,67 @@ fn all_tables_are_strict() {
     }
 }
 
+/// Compte les lignes INSERT ACTIVES (non commentées) ciblant `passthrough_node`
+/// dans `db/seed_passthrough.sql`. Indépendant du contenu réel : marche que le
+/// fichier ait 0 ou 46 adresses. Le format imposé (une ligne INSERT par adresse,
+/// `INSERT OR IGNORE INTO passthrough_node`) rend ce comptage fiable.
+fn count_seed_inserts() -> i64 {
+    let sql = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/db/seed_passthrough.sql"
+    ))
+    .expect("lecture db/seed_passthrough.sql");
+    sql.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("--"))
+        .filter(|line| {
+            line.contains("INSERT OR IGNORE INTO passthrough_node")
+                || line.contains("INSERT INTO passthrough_node")
+        })
+        .count() as i64
+}
+
+#[test]
+fn init_seeds_passthrough_denylist() {
+    let (_dir, path) = temp_db();
+    let conn = db::init(&path).expect("init");
+
+    // Le nombre de lignes 'seed' en base doit refléter EXACTEMENT le nombre
+    // d'INSERT actifs du fichier. Si le seeding est débranché, ce test casse.
+    let expected = count_seed_inserts();
+    let seeded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM passthrough_node WHERE source='seed';",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count seed");
+    assert_eq!(
+        seeded, expected,
+        "init doit insérer exactement les {expected} adresses 'seed' du fichier"
+    );
+}
+
+#[test]
+fn init_seeding_is_idempotent() {
+    let (_dir, path) = temp_db();
+    db::init(&path).expect("premier init");
+    // Un second init ne doit créer aucun doublon (INSERT OR IGNORE sur la PK).
+    let conn = db::init(&path).expect("second init");
+    let seeded: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM passthrough_node WHERE source='seed';",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count seed");
+    assert_eq!(
+        seeded,
+        count_seed_inserts(),
+        "le ré-init ne doit pas dupliquer les lignes 'seed'"
+    );
+}
+
 #[test]
 fn reset_recomputable_respects_drop_frontier() {
     let (_dir, path) = temp_db();

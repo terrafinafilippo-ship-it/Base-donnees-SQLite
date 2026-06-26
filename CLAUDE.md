@@ -19,8 +19,9 @@ prédictions et à enregistrer les `trade_outcome` qu'il remonte.
 
 ```
 db/schema.sql       Source de vérité UNIQUE du schéma (DDL, commentaires inclus).
+db/seed_passthrough.sql  Denylist passthrough permanente (source='seed'), appliquée à l'init.
 src/lib.rs          Déclare les modules db / ingest / analyze + helper now_unix_ms().
-src/db/mod.rs       init() + reset_recomputable(). Lit/applique schema.sql.
+src/db/mod.rs       init() + reset_recomputable(). Lit/applique schema.sql puis seed_passthrough.sql.
 src/ingest/mod.rs   Ingestor : écrit BRUT + FACT-LIKE (append-only, idempotent).
 src/analyze/mod.rs  Analyseur : clustering, profil bayésien, scoring, passthrough, file.
 src/bin/analyze.rs  CLI : exécute un tick d'analyse sur une base et affiche le bilan.
@@ -51,13 +52,16 @@ cargo run --bin analyze [chemin.db]   # un tick d'analyse (défaut : intel.db)
 
 ### `src/db/mod.rs`
 - `init(path: &str) -> Result<Connection>` : ouvre/crée la base, applique les PRAGMAs
-  (`journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`) puis le schéma.
-  **Idempotent** — sûr à rappeler à chaque démarrage.
+  (`journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`), le schéma, **puis** le
+  seed de la denylist passthrough (`db/seed_passthrough.sql`, lignes `source='seed'`).
+  **Idempotent** — sûr à rappeler à chaque démarrage (le seed est en `INSERT OR IGNORE`).
 - `reset_recomputable(conn: &Connection) -> Result<()>` : DROP/recrée UNIQUEMENT les tables
-  recalculables et purge `passthrough_node WHERE source='auto'`. Transactionnel.
+  recalculables et purge `passthrough_node WHERE source='auto'`. Transactionnel. Ne touche
+  jamais les lignes `source='seed'` et ne réapplique pas le seed (inutile : jamais supprimé).
 
-Le DDL n'est **jamais** écrit en dur dans le Rust : `schema.sql` est embarqué via
-`include_str!` (lecture au build), `schema.sql` reste la seule source de vérité.
+Ni le DDL ni les adresses ne sont **jamais** écrits en dur dans le Rust : `schema.sql` et
+`seed_passthrough.sql` sont embarqués via `include_str!` (lecture au build) et restent les
+seules sources de vérité.
 
 ### `src/ingest/mod.rs`
 - Structures d'entrée : `TokenLaunch`, `WalletFlow`, `LaunchParticipant`, `TokenOutcome`,
