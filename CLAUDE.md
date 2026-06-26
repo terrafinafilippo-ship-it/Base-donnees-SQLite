@@ -1,6 +1,29 @@
 # CLAUDE.md
 
-Guide pour travailler dans ce dépôt. À lire avant toute modification.
+Guide pour travailler dans ce dépôt. À lire **en entier** avant toute modification.
+
+---
+
+> **CONTEXTE CRITIQUE — lis ceci en premier.**
+>
+> Ce fichier est destiné à **UN développeur unique** qui travaillera **SEUL** sur ce
+> dépôt, avec sa propre instance de Claude Code, sans aucun accès à l'historique ni à
+> la mémoire de projet d'où vient le contexte ci-dessous. Ce développeur possède
+> **AUSSI le bot de snipe externe** (dépôt séparé) : il est donc la seule personne au
+> monde qui détient le contexte du bot. Il prendra **TOUTES** les décisions lui-même,
+> à partir de ce que son Claude Code lui proposera en lisant ce fichier.
+>
+> **Conséquences pour la rédaction :**
+> - Il n'existe **PAS** de « propriétaire » tiers à qui remonter quoi que ce soit.
+>   Ne crée jamais de décision « en attente de validation externe ». Chaque décision
+>   ouverte doit être tranchable **PAR LUI**, et ce fichier doit lui donner de quoi
+>   la trancher.
+> - Ce fichier ne doit pas seulement **lister** les décisions ouvertes : il doit
+>   **enseigner** comment chacune se tranche (défaut recommandé + protocole de test +
+>   signal d'échec). Un développeur seul face à une décision sans méthode choisit au
+>   hasard ; c'est ce qu'il faut éviter.
+
+---
 
 ## Projet
 
@@ -79,10 +102,14 @@ seules sources de vérité.
   (passthrough → enqueue deployers → analyse). Idempotent.
 - `detect_passthrough`, `enqueue_new_deployers`, `analyze_deployer` exposés pour usage ciblé.
 - `METHOD_VERSION` : version de méthode estampillée sur `cluster` / `score_prediction`.
-- Clustering : 4 types de liens (`funding`, `consolidation`, `cobehavior`, `exclusivity`),
-  un seul retenu par wallet (le plus fort). Profil : modèle Beta-Bernoulli du taux de rug
-  (`risk` = moyenne a posteriori, `confidence` croît avec `token_count`). Un rug = un
-  `token_outcome` terminal `final=1`.
+- Clustering (`METHOD_VERSION = 2`) : 2 types **fondateurs** (`funding` = deployer→wallet,
+  `consolidation` = wallet→deployer) tirés uniquement des flux de fonds
+  (`raw_wallet_flow`) — seuls ces liens créent l'appartenance à un cluster. La
+  co-participation (`raw_launch_participant`) est un **bonus corroboratif** borné
+  (`COBEHAVIOR_BONUS_MAX × share`, plafonné à `COBEHAVIOR_STRENGTH_CAP`) qui renforce
+  la force d'un lien déjà fondé, jamais le type ni l'appartenance elle-même. Profil :
+  modèle Beta-Bernoulli du taux de rug (`risk` = moyenne a posteriori, `confidence`
+  croît avec `token_count`). Un rug = un `token_outcome` terminal `final=1`.
 
 ## Schéma — 11 tables, classées par cycle de vie
 
@@ -134,3 +161,51 @@ les effacer casse la boucle d'apprentissage.
    (ingestor = BRUT/FACT-LIKE ; analyseur = dérivé + `analysis_queue`) et étendre
    `tests/ingest.rs` ou `tests/analyze.rs`.
 5. `cargo test` — tout doit rester vert.
+
+---
+
+## 6 — Décisions à trancher
+
+**Deux natures de décision — lis avant d'agir :**
+
+**(A) ARCHITECTURE / INTERFACE** — se tranche par cohérence avec la topologie figée et,
+pour tout ce qui touche le bot, par confrontation avec **le dépôt du bot que TU possèdes**.
+Aucune mesure possible a priori ; c'est un choix de conception à faire **TÔT** car il
+conditionne le reste.
+
+**(B) CALIBRATION / OPS** — se tranche par la **mesure sur données réelles**. Ne pas figer
+avant d'avoir la donnée ; utiliser la valeur par défaut indiquée en attendant.
+
+| # | Décision | Options | Défaut si tu ne sais pas | Comment trancher (critère concret) | Signal que tu t'es trompé |
+|---|---|---|---|---|---|
+| A1 | **Source ingestor** ⚠️ LA PLUS IRRÉVERSIBLE — pas de backfill, ce qui n'est pas capturé est perdu définitivement. À trancher AVANT d'écrire une ligne de code réseau. | Jito ShredStream gRPC `SubscribeEntries` (décision figée de la topologie) vs Geyser (suggéré par un commentaire trompeur du code) | **ShredStream** | Vérifier que la topologie du bot appelle ShredStream. Si le bot reçoit déjà des entries pré-confirmation via Jito, utiliser la même source garantit la cohérence temporelle. | Gaps de séquence massifs dans `raw_wallet_flow.slot` ; ou intentions pré-confirmation comptées comme transactions settlées (fausse finalité). |
+| A2 | **Jonction avec le bot** ⚠️ À FAIRE EN PREMIER — sans cette vérification tout le reste peut être inutile. | Champs de `score_prediction` + `cluster_profile` tels qu'ils sont vs adapter le schéma/l'algo pour matcher ce que le bot lit | **Aucun défaut** — tu DOIS ouvrir le dépôt du bot et comparer | Lister les champs que le bot consomme depuis sa lecture en cache RAM. Les confronter colonne par colonne aux tables produites. Documenter le mapping dans la section 10. | Le bot ne trouve pas un champ (KeyError / champ NULL), ou il interprète `risk` dans une échelle différente (ex. [0,100] vs [0,1]). |
+| A3 | **Asymétrie de coût rugger** : faux alive (perte de capital) est bien plus coûteux qu'un faux rug (manque à gagner). Le seuil symétrique `RISK_THRESHOLD=0.5` ne le capture pas. | Seuil asymétrique plus élevé (ex. 0.7) ; exiger un `label terminal final=1` avant tout achat ; s'appuyer sur le blanchiment lent (Lot 2) | **Attendre Lot 2 + ne jamais traiter un cluster sans historique suffisant comme sûr** (`MIN_SAMPLES_FOR_RUGGER` est là pour ça) | Ouvrir le dépôt du bot : comment classe-t-il un cluster sans historique ? Si le bot passe outre `is_rugger=0` sans vérifier `token_count`, c'est une faille. Corriger côté bot ou ajouter un champ `maturity_flag`. | Le bot achète des tokens d'un deployer dont le cluster a `token_count < MIN_SAMPLES` et qui rugge peu après. |
+| B1 | **`MATURITY_MS` (défaut 24 h)** : fenêtre en dessous de laquelle un token sans label terminal est comptabilisé comme « alive » à la volée. | 24 h (valeur actuelle) vs recaler sur le « genou » de la distribution temps-jusqu'au-rug | **24 h** jusqu'à avoir la donnée | Accumuler des `token_outcome` réels, tracer l'histogramme du délai `launch_slot → observed_slot` du premier label terminal. Prendre le percentile 90. | Trop court → des rugs en cours comptés comme alive, profil de risque sous-estimé. Trop long → blanchiment jamais atteint, tous les clusters restent suspects indéfiniment. |
+| B2 | **Seuils et priors** (`RISK_THRESHOLD`, `MIN_SAMPLES_FOR_RUGGER`, `PASSTHROUGH_MIN_DEGREE`, `CONFIDENCE_K`, `COBEHAVIOR_BONUS_MAX`, `PRIOR_ALPHA/BETA`) | Valeurs actuelles du code vs valeurs calibrées sur données réelles | **Valeurs actuelles** — ne pas les changer dans le vide | Constituer un eval set de 20-30 deployers étiquetés à la main (rugger / pas rugger, source : données historiques on-chain). Faire varier chaque paramètre, mesurer précision + rappel. Enregistrer la courbe précision/rappel dans la section 10. | Trop de faux positifs (clusters sains bloqués, le bot ne snipe rien) ou trop de faux négatifs (ruggers non détectés, pertes répétées). |
+| B3 | **`N_final = 32 slots`** (finalité anti-fork dans `token_outcome.is_final`) | 32 slots (valeur actuelle) vs valeur empirique | **32** | Sur un échantillon de données réelles, vérifier qu'aucun label `final=1` posé à slot S ne s'inverse après S+32. Si un reorg est observé, augmenter. | Un label terminal `final=1` est contredit par un bloc postérieur (reorg réel observé). |
+| B4 | **Filtre ingestor** : quels flux écrire dans `raw_wallet_flow` | Statique (program IDs fixes : pump.fun, PumpSwap, DEX connus) vs dynamique (HashSet de wallets surveillés, rafraîchi depuis l'analyseur) | **Statique d'abord** pour valider le pipeline, dynamique ensuite | Mesurer le taux de liens de consolidation manqués (wallet non connu au moment de la tx, son financement est dans le passé). Si le taux est élevé, activer le lookup RPC rétroactif côté analyseur (Lot 4), pas le filtre. | Clusters fragmentés alors que les wallets sont visiblement liés on-chain ; liens de consolidation absents de `raw_wallet_flow` pour des transactions publiques. |
+| B5 | **Granularité du décodage dans l'ingestor** avant écriture `raw_*` (latence hot-path vs volume) | Décoder le minimum (mint, src, dst, slot, amount) vs décoder davantage de champs dès l'entrée | **Décoder le minimum** — on peut toujours enrichir plus tard, on ne peut pas défaire une latence produite | Mesurer le temps de traitement par entry sous charge réelle (Jito produit ~50k entries/s en pointe). Si le hot-path est sous 100 µs/entry, le décodage est neutre. | Temps de traitement par entry > 200 µs sous charge, retard de la file ShredStream, slots manqués. |
+| B6 | **Modèle Claude pour le jugement qualitatif de l'analyseur** (Lot futur) | claude-sonnet-4-6 via Batch API + prompt caching vs autre modèle | **claude-sonnet-4-6** | Construire l'eval set (voir B2). Comparer les verdicts du modèle aux étiquettes manuelles. Figer chaque verdict avec la version du modèle (champ `method_version` sur `score_prediction`) pour reproductibilité de la calibration. | Verdicts incohérents entre deux runs sans changement de données ; ou précision < 70 % sur l'eval set. |
+| B7 | **Infra : Hetzner Frankfurt vs Falkenstein** (cible AX42 bare metal) | Frankfurt (latence Jito légèrement meilleure selon la géographie du PoP) vs Falkenstein | **AX42 en provisoire**, à valider avant prod | Lancer deux instances en parallèle 24 h, comparer : `nstat -az | grep RcvbufErrors` (overflows UDP), `mpstat -P ALL 5` (CPU par core), taux de croissance de la DB. Choisir celle avec le moins d'overflow. | RcvbufErrors > 0 en continu → l'instance perd des entries. Croissance DB anormalement faible → des flux sont silencieusement ignorés. |
+| B8 | **Index `(src,dst)` sur `raw_wallet_flow`** (interdit par invariant, levable si mesuré) | Pas d'index (défaut verrouillé) vs index ajouté après mesure | **Pas d'index** — ne pas ajouter avant mesure | UNIQUEMENT si `detect_passthrough` ou `collect_members` deviennent un goulot mesuré (ex. > 500 ms par tick sur une DB de production). Mesurer avec `EXPLAIN QUERY PLAN` + `sqlite3_profile`. Documenter la mesure en section 10 avant d'ajouter l'index. | `detect_passthrough` ou `collect_members` dépasse 500 ms sur la DB de production (> 1M lignes `raw_wallet_flow`). |
+
+---
+
+## 6bis — Comment trancher quand tu es seul
+
+Méthode générale, à appliquer à toute décision de ce fichier ou que Claude Code te soumet :
+
+**1. Regarde la nature de la décision.**
+- **(A) Architecture/interface** → tranche par cohérence avec la topologie (section 2 et le bot) et, si ça touche le bot, en **ouvrant le dépôt du bot**. Fais-le **tôt**.
+- **(B) Calibration/ops** → ne tranche **pas** dans le vide. Pose le défaut recommandé, continue, et reviens trancher quand tu as la donnée réelle.
+
+**2. Avant de figer une décision (A) irréversible** (au premier chef : la source de l'ingestor), écris en une phrase ce que tu perdrais si tu te trompais. Si la réponse est « des données impossibles à récupérer », traite-la comme **bloquante** et prends le temps de vérifier.
+
+**3. Quand tu tranches, trace-le.**
+Date + choix + raison, dans la section 10 (trace de décision). Si le choix engage le schéma → reporte-le dans CLAUDE.md. S'il engage l'algo → commente-le dans le code avec `// DÉCISION :`. Une décision non tracée sera re-débattue dans un mois.
+
+**4. Ordre conseillé pour démarrer :**
+- **(a) Jonction bot (A2) en premier** — gratuit, et peut invalider des semaines de travail.
+- **(b) Lot 2 ensuite** — pur, sans réseau, implementable immédiatement.
+- **(c) Puis trancher A1 (source ingestor)** et attaquer le Lot 3 (ingestor réseau).
