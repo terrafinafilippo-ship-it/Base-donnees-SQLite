@@ -254,3 +254,48 @@ clusters → on garde le plus risqué (prudence). Lecture **seule** (`PRAGMA
 query_only=1`), rafraîchie toutes les `CACHE_REFRESH_SECONDS`, swap atomique ; base
 analyseur absente → fallback propre. Câblé au démarrage du bot
 (`main.py : cluster_cache.start_background()`).
+
+### 2026-06-27 — Lot 3 : ingestor réseau ShredStream (VALIDÉ EN LIVE)
+Coque gRPC tonic du dépôt `matbolze/solana-memecoin-ingestor` durcie (reconnexion à
+backoff + writer SQLite découplé d'un canal borné = backpressure propre, exigences A1)
+puis **validée sur le VPS** contre le proxy Jito local (`127.0.0.1:9999`) : connexion +
+abonnement + écriture OK, **21 launches réels** écrits dans `raw_token_launch` (+
+co-acheteurs), `[gaps] vus=3000 manquants=0` (séquence de slots parfaite → le risque A1
+d'incohérence temporelle est écarté). `raw_wallet_flow` reste à 0 (Scope A) → traité par
+B4 ci-dessous.
+
+### 2026-06-27 — B4 : flux fondateurs `raw_wallet_flow` par backfill RPC (RÉSOLUE — gap fermé)
+`collect_members` ne fonde l'appartenance que sur `funding` (src=deployer) et
+`consolidation` (dst=deployer) tirés de `raw_wallet_flow`. L'ingestor live (Scope A)
+n'écrit que launches+co-acheteurs → ces flux manquaient → clusters creux. **Tranché :
+backfill RPC rétroactif** (option « dynamique » de B4), car les arêtes de financement
+sont ANTÉRIEURES à la vue live du deployer (jamais captables en live).
+
+Implémenté **côté bot, en Python** (pas en Rust) pour deux contraintes dures : budget
+Helius fini (réutilise le client RPC déjà discipliné en crédits du bot, comme
+`analyze_dev`) et VPS 2 cœurs latence-critique (pas de pile TLS Rust à recompiler sur la
+prod). Tient le **rôle ingestor** (écrit UNIQUEMENT `raw_wallet_flow`, `INSERT OR IGNORE`,
+`kind='sol'`, `mint=NULL`) → frontière de propriété respectée ; l'analyseur Rust lit
+ensuite ces flux. Bornage (crédits) : 1 `getSignaturesForAddress` + ≤`BACKFILL_TX_MAX`
+(déf. 6) `getTransaction` par deployer, ≤`BACKFILL_MAX_DEPLOYERS`/run, sleep entre appels.
+Idempotence au niveau deployer via base d'état **séparée** (`backfill_state.db`, hors
+schéma partagé) — indispensable car un flux SOL natif (`mint=NULL`) n'est PAS dédupliqué
+par `UNIQUE(sig,src,dst,mint)` (NULL != NULL côté SQLite).
+
+**Validé LIVE** : 18 deployers réels (de l'intel.db rempli par Lot 3) → **308 flux
+fondateurs écrits** (~126 appels RPC), arêtes structurellement correctes (incidentes au
+deployer, funding priorité-1).
+
+LIMITES connues (calibration, NON bloquant) : (1) on prend les `TX_MAX` signatures les
+**plus anciennes** = financement d'origine pour un wallet frais (cas rugger typique) ; un
+wallet réutilisé à long historique peut avoir son financement initial au-delà de
+`limit=1000` → on capte alors ses funding-out récents (liens priorité-1 valides, pas du
+bruit). (2) Les micro-transferts (fees pump / tips Jito ~0.0003 SOL) sont écrits tels
+quels : leur exclusion est le rôle du **denylist passthrough** (seed + détection auto
+fan-in/out), PAS de l'ingestor (qui écrit des faits) → à surveiller en B2.
+
+Fichiers bot : `src/analysis/flow_backfill.py` (cœur pur testé + worker),
+`scripts/flow_backfill_worker.py` (CLI `--loop`), `tests/test_flow_backfill.py` (6 tests).
+**Reste** : déployer l'analyseur Rust sur le VPS (maillon flux→cluster→profil→cache bot,
+aujourd'hui le seul chaînon non encore exécuté en prod) et planifier le worker
+(cron/systemd, état persistant hors conteneur éphémère).
