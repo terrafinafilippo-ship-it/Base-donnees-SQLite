@@ -209,3 +209,48 @@ Date + choix + raison, dans la section 10 (trace de décision). Si le choix enga
 - **(a) Jonction bot (A2) en premier** — gratuit, et peut invalider des semaines de travail.
 - **(b) Lot 2 ensuite** — pur, sans réseau, implementable immédiatement.
 - **(c) Puis trancher A1 (source ingestor)** et attaquer le Lot 3 (ingestor réseau).
+
+---
+
+## 10 — Trace de décision
+
+> Date + choix + raison. Une décision non tracée sera re-débattue dans un mois.
+
+### 2026-06-27 — A1 : source ingestor = **Jito ShredStream** (FIGÉE)
+Cohérent avec la topologie et avec le bot (qui consomme déjà des entries
+pré-confirmation via Jito). Le Lot 3 (ingestor réseau) est implémenté dans un dépôt
+séparé `matbolze/solana-memecoin-ingestor` (workspace Rust : décodeur pur
+`pump-create-decode` + binaire `ingestor` + coque gRPC `ingestor-shredstream`). Il
+dépend de cette lib (`solana_memecoin_db::ingest`, rev `d6d5a43`) et écrit le BRUT.
+État : décodage `create` + co-acheteurs (`buy` standard, acheteur=compte[6]) prouvés
+par golden tests ; mapping → `ingest_batch` testé contre une vraie base ; coque tonic
+compile, **à valider au 1er run VPS**. ⚠️ L'ingestor n'écrit PAS encore
+`raw_wallet_flow` (Scope A) → le clustering n'a pas de liens fondateurs tant que ce
+n'est pas réglé (cf. B4 / Lot 4 — décision à trancher ensuite).
+
+### 2026-06-27 — A2 : jonction analyseur → bot (RÉSOLUE)
+Confrontation des champs produits (`cluster_profile`) vs consommés par le gate du bot
+(`entry_gate` → `rugger_graph.Verdict` / `dev_analyzer`). Jonction implémentée et
+testée **côté bot** (`src/analysis/cluster_cache.py` + `src/trading/entry_gate.py`,
+13 tests verts). 3 pièges tranchés :
+
+- **Échelle** : `risk` est en **[0,1]** (moyenne Beta) ; le gate pense en **0-100**.
+  → conversion `round(risk*100)` AU point de jonction. Aucune valeur [0,1] ne fuit
+  dans le gate. Seuils alignés (0.5 ↔ 50).
+- **Seuil = politique du BOT** : le bot lit `risk`/`confidence`/`token_count` bruts et
+  applique SON seuil (coût asymétrique faux-alive ≫ faux-rug, cf. A3). `is_rugger`
+  pré-calculé n'est qu'un indice, jamais une vérité aveugle.
+- **Garde A3 (token_count)** : un cluster `risk≥seuil` mais `token_count<MIN_SAMPLES`
+  n'est **ni rugger ni « sûr »** → reste « inconnu » côté gate (entrée conditionnée au
+  momentum). `is_cluster_rugger` impose `token_count≥MIN_SAMPLES` ET `risk≥seuil`.
+- **Sens / périmètre** : l'analyseur n'alimente QUE le côté rugger ; jamais de
+  « trusted ». La whitelist `good_devs` du bot reste curée et séparée.
+
+**Mapping du cache RAM** (lookup t=0, clé = wallet du créateur) :
+`cluster_member ⋈ cluster_profile` **∪ `cluster.anchor_wallet ⋈ cluster_profile`**
+(les deployers ne sont PAS dans `cluster_member`). **PAS `score_prediction`** (par-mint,
+calculé après analyse → un mint neuf n'y est pas au t=0). Wallet dans plusieurs
+clusters → on garde le plus risqué (prudence). Lecture **seule** (`PRAGMA
+query_only=1`), rafraîchie toutes les `CACHE_REFRESH_SECONDS`, swap atomique ; base
+analyseur absente → fallback propre. Câblé au démarrage du bot
+(`main.py : cluster_cache.start_background()`).
