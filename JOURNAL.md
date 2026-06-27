@@ -1,0 +1,195 @@
+# JOURNAL DE BORD — la base de données en production
+
+> But de ce fichier : raconter **tout ce qui a été câblé AUTOUR de cette base** (qui
+> l'alimente, qui la lit, comment, où, avec quels commits). Le `CLAUDE.md` contient les
+> *décisions* (le pourquoi, verrouillé) ; ce journal contient l'*opérationnel* (le quoi/où,
+> chronologique). Lis-le pour comprendre comment ta base vit hors de ce dépôt.
+>
+> ⚠️ Cette base est le **point de rendez-vous** de 3 composants répartis sur 2 autres dépôts.
+> Ce dépôt ne contient que la persistance + l'analyseur. L'ingestor et le bot vivent ailleurs
+> (voir la carte ci-dessous) mais écrivent/lisent CETTE base.
+
+---
+
+## 1. Carte du système (qui est où)
+
+| Composant | Dépôt | Langage | Rôle vis-à-vis de CETTE base |
+|---|---|---|---|
+| **Persistance + Analyseur** | `terrafinafilippo-ship-it/Base-donnees-SQLite` (CE dépôt) | Rust | crée le schéma ; l'analyseur ÉCRIT les tables dérivées, LIT le brut |
+| **Ingestor réseau** | `matbolze/solana-memecoin-ingestor` (privé) | Rust | ÉCRIT le BRUT (`raw_token_launch`, `raw_launch_participant`) depuis ShredStream |
+| **Bot de snipe** | `matbolze/bot-sniping`, branche `feat/trading-terminal` | Python | ÉCRIT `raw_wallet_flow` (backfill RPC) ; LIT `cluster_profile` (cache t=0) |
+
+Tous reliés UNIQUEMENT par le fichier SQLite partagé (WAL). Aucun couplage direct.
+
+---
+
+## 2. Le câblage de la base — qui écrit / lit quoi
+
+Respect strict de la **frontière de propriété** (cf. CLAUDE.md §66) :
+
+| Table | Écrite par | Lue par | Comment |
+|---|---|---|---|
+| `raw_token_launch` | Ingestor Rust (daemon ShredStream) | Analyseur, backfill, outcome-tracker | `ingest_batch`, append-only idempotent |
+| `raw_launch_participant` | Ingestor Rust (co-acheteurs) | Analyseur | idem |
+| `raw_wallet_flow` | **Backfill Python** (rôle ingestor) | Analyseur (`collect_members`, `detect_passthrough`) | `INSERT OR IGNORE`, `kind='sol'`, `mint=NULL` |
+| `passthrough_node` (seed) | seed appliqué à `init` | Analyseur | 46 hubs (denylist permanente) |
+| `cluster`, `cluster_member`, `cluster_profile`, `score_prediction` | **Analyseur Rust** (`run_once`) | **Bot** (cache RAM `cluster_profile`) | dérivé recalculable |
+| `token_outcome` | ⚠️ **PERSONNE encore** (voir §6) | Analyseur (`compute_profile.rug_count`) | — |
+| `trade_outcome` | (futur : journal du bot) | Analyseur | — |
+
+> Note importante : un 4ᵉ flux (le « côté gagnant », détection des BONS devs par graduation)
+> tourne aussi, mais il **n'écrit PAS dans cette base** — voir §5.4 pour pourquoi.
+
+---
+
+## 3. Le trajet de la donnée (vue d'ensemble)
+
+```
+ Réseau Jito ─► jito-shredstream-proxy (VPS :9999) ─► entries (push gRPC, ~100-500ms avant le bloc)
+                                                          │  (fan-out : 2 abonnés)
+         ┌────────────────────────────────────────────────┴───────────────┐
+         ▼                                                                  ▼
+   BOT (Python, hot path)                                   INGESTOR (Rust daemon)
+   décode → décide achat/skip (O(1) RAM)                    décode → écrit le BRUT
+         ▲                                                          │ raw_token_launch
+         │ lookup t=0                                               │ raw_launch_participant
+         │                                                          ▼
+   cluster_cache (RAM) ◄──── cluster_profile ◄──── ANALYSEUR (Rust, /5min) ◄──── intel.db
+                                                   clusters + risque bayésien      ▲
+                                                                                   │ raw_wallet_flow
+                                                              BACKFILL (Python, /10min, Helius RPC)
+                                                              « qui a financé ce deployer ? »
+```
+
+---
+
+## 4. Journal chronologique — 2026-06-27
+
+### 4.1 — Seed passthrough (denylist permanente)
+46 adresses hubs vérifiées ajoutées dans `db/seed_passthrough.sql` (`source='seed'`, jamais
+droppées). Test `reset_recomputable_respects_drop_frontier` corrigé : il supposait un seed
+vide (`== 1`), passé à `count_seed_inserts() + 1`. **Commit `d6d5a43`.**
+
+### 4.2 — Ingestor réseau (dépôt `matbolze/solana-memecoin-ingestor`)
+Workspace Rust à 3 crates, `default-members` excluant la coque réseau (pour que `cargo test`
+ne compile que le pur) :
+- `pump-create-decode` : décodeur PUR du wire Solana (legacy + v0), dépendance unique `bs58`.
+  Décode `create` (mint, creator, name/symbol/uri) ET les co-acheteurs (`buy` standard, disc
+  `66063d1201daebea`, acheteur = compte[6]). 10 golden tests, **byte-parité prouvée** contre
+  le décodeur Python du bot.
+- `ingestor` (lib) : `entry::iter_transactions` (framing du blob `Vec<Entry>`),
+  `pipeline::process_entries_blob` (blob → `EventBatch`, cœur pur), `sink` (mapping →
+  `ingest::TokenLaunch`/`LaunchParticipant`), `gaps::SlotTracker` (trous de slot).
+- `ingestor-shredstream` (coque réseau tonic) : client gRPC Jito `SubscribeEntries` →
+  `process_entries_blob` → `ingest_batch`. **Durcie** (commit `05b18d7`) : boucle de
+  **reconnexion** à backoff (un drop ne tue plus l'ingestion — exigence A1) + **writer
+  SQLite découplé** d'un canal borné (l'écriture bloquante ne gèle plus le récepteur async
+  sous burst Jito).
+- Dépend de CE dépôt : `solana-memecoin-db` (git, rev `d6d5a43`).
+
+**Validé EN LIVE sur le VPS** contre le proxy local `127.0.0.1:9999` : connexion +
+abonnement + écriture OK, 21 launches réels écrits, **`[gaps] vus=3000 manquants=0`**
+(séquence de slots parfaite → le risque A1 d'incohérence temporelle est écarté).
+
+### 4.3 — A2 : jonction analyseur → bot (le bot LIT `cluster_profile`)
+Côté bot (`src/analysis/cluster_cache.py`) : cache RAM lecture-seule (`PRAGMA query_only=1`)
+de `cluster_member ⋈ cluster_profile` ∪ `cluster.anchor_wallet ⋈ cluster_profile`, lookup
+O(1) au t=0, refresh périodique, swap atomique. 3 pièges tranchés : **échelle**
+(`risk`[0,1] → score 0-100 converti côté bot), **sens** (alimente seulement le côté rugger),
+**garde A3** (cluster `token_count < MIN_SAMPLES` = ni rugger ni sûr). 13 tests verts.
+Décision tracée CLAUDE.md §10. **Commit bot `c659ebf`.**
+
+### 4.4 — Lot 4 / B4 : `raw_wallet_flow` par backfill RPC (gap fermé)
+`collect_members` ne fonde l'appartenance que sur `funding`/`consolidation` tirés de
+`raw_wallet_flow`. L'ingestor live ne les voit pas (antérieurs au launch). → **backfill RPC
+rétroactif** (option « dynamique » de B4). Implémenté côté bot Python (réutilise le client
+RPC discipliné en crédits du bot + évite une pile TLS Rust sur le petit VPS), **rôle
+ingestor** : écrit UNIQUEMENT `raw_wallet_flow`. Borné, idempotent au niveau deployer (état
+SÉPARÉ `backfill_state.db`, car `mint=NULL` n'est pas dédupliqué par `UNIQUE`). **Validé
+live : 18 deployers → 308 flux.** **Commit bot `3d429fe`.** Trace CLAUDE.md §10.
+
+### 4.5 — Analyseur déployé sur le VPS (le maillon flux→cluster→profil)
+Binaire `analyze` (CE dépôt) buildé sur le VPS. Premier run sur la base alimentée :
+**18 clusters, 218 membres, 18 profils, 21 prédictions**, 46 passthrough seed appliqués.
+Puis vérifié que le **cache du bot lit bien ces profils** : `cluster_cache.refresh()` → 221
+wallets chargés, `get(ancre)` → profil réel, `is_cluster_rugger` correct (garde A3). 
+
+➡️ **Boucle complète prouvée de bout en bout** : ShredStream → ingestor → backfill →
+analyseur → cache bot.
+
+### 4.6 — Trace des décisions
+A1 (source = ShredStream, figée), A2 (résolue), Lot 3 (ingestor validé), B4 (backfill)
+écrites dans `CLAUDE.md` §10. **Commit `88b1f49`.**
+
+---
+
+## 5. Déploiement 24/7 (le câblage opérationnel sur le VPS)
+
+VPS Hetzner « shredstream », 2 cœurs. Bot latence-critique → tout le pipeline tourne en
+**basse priorité** (`Nice`) pour ne jamais voler de CPU au hot path.
+
+### 5.1 — Base partagée unique
+`/root/astra-terminal/data/intel.db` — sur le **bind-mount** du conteneur `astra-terminal`
+(= `/app/data/intel.db` à l'intérieur). Ainsi les binaires **host** (ingestor, analyzer) ET
+les workers **conteneur** (backfill, outcomes, cache bot) lisent/écrivent le **même fichier**
+(même inode, verrous SQLite WAL OK).
+
+### 5.2 — 4 jobs systemd
+| Unité | Type | Fréquence | Commande |
+|---|---|---|---|
+| `memecoin-ingestor.service` | daemon | continu (Restart=always, `Nice=10`) | `…/ingestor-shredstream` (host), `DB_PATH=…/intel.db`, endpoint `127.0.0.1:9999` |
+| `memecoin-backfill.timer` | oneshot | 10 min | `docker exec astra-terminal python /app/scripts/flow_backfill_worker.py` |
+| `memecoin-analyzer.timer` | oneshot | 5 min | `…/memecoin-analyzer/target/debug/analyze …/intel.db` (host) |
+| `memecoin-outcomes.timer` | oneshot | 10 min | `docker exec astra-terminal python /app/scripts/outcome_worker.py` |
+
+Binaires : ingestor `release` (`/root/solana-memecoin-ingestor/target/release/`), analyzer
+`debug` (`/root/memecoin-analyzer/target/debug/`). Toolchain : rustup installé sur le host,
+builds en `nice -n 19 -j1`.
+
+### 5.3 — Persistance des fichiers Python côté conteneur
+`cluster_cache.py`, `flow_backfill.py`, `outcome_tracker.py` + workers injectés dans
+`astra-terminal` puis **bakés** : `docker commit` → image `astra-terminal:latest` (sauvegarde
+de l'ancienne = `astra-terminal:pre-lot4` pour rollback). Le conteneur de trading **n'a pas
+été redémarré** (choix prudence : c'est le conteneur live).
+
+### 5.4 — Côté GAGNANT (hors de cette base — à savoir)
+En parallèle du modèle rugger, un tracker repère les **MEILLEURS devs** (ceux dont les tokens
+**graduent** la bonding curve pump.fun ~85 SOL). Il lit l'état de courbe via `getAccountInfo`
+(parse `complete` + `real_sol_reserves`), agrège par dev, et sortira la whitelist à sniper au
+bloc 0. **Il N'ÉCRIT PAS dans cette base** : ton analyseur compte TOUT `token_outcome`
+terminal comme un RUG ; écrire « graduated » ici flaggerait chaque bon dev en rugger. Le côté
+gagnant vit donc côté bot, dans un store séparé (`outcomes.db`). Mentionné ici pour que tu
+saches qu'il existe et pourquoi il ne touche pas tes tables. **Commit bot `dd4a3ad`.**
+
+---
+
+## 6. État actuel & ce qui reste (côté CETTE base)
+
+**Ce qui marche** : le brut est alimenté en continu (ingestor + backfill), l'analyseur tourne
+toutes les 5 min et produit clusters/profils, le bot les consomme. Le pipeline est autonome.
+
+**⚠️ LE gap qui rend le modèle de risque INERTE** : `token_outcome` n'est **écrit par
+personne** → `compute_profile.rug_count = 0` partout → `risk` = prior (0.333) pour tous →
+**aucun rugger n'est jamais détecté**. C'est la priorité avant tout réglage : il faut un
+producteur de `token_outcome` (labels `lp_pulled`/`price_zero`/`dev_dumped`, rôle ingestor
+= FACT-LIKE). Tant que c'est absent :
+- **Lot 2 (blanchiment lent)** agirait sur des preuves de rug inexistantes → prématuré ;
+- **calibration B2/B6** (eval set) n'a aucun signal rug/non-rug à calibrer → bloquée.
+
+**Mineurs** : raffiner `gaps` via le leader schedule ; micro-transferts fees/tips (à exclure
+côté passthrough, B2) ; extraction acheteur `buy_v2` si besoin.
+
+---
+
+## 7. Pointeurs commits
+
+| Dépôt | Commit | Quoi |
+|---|---|---|
+| CE dépôt | `d6d5a43` | seed passthrough (46) + fix test frontière |
+| CE dépôt | `88b1f49` | CLAUDE.md §10 : traces A1/A2/Lot3/B4 |
+| ingestor | `05b18d7` | coque ShredStream durcie (reconnexion + writer découplé) |
+| bot | `c659ebf` | A2 — cache RAM des profils (lit `cluster_profile`) |
+| bot | `3d429fe` | Lot 4 — backfill `raw_wallet_flow` |
+| bot | `dd4a3ad` | côté gagnant (graduation) — hors de cette base |
+
+_Dernière mise à jour : 2026-06-27._

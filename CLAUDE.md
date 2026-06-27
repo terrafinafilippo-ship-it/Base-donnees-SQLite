@@ -41,6 +41,9 @@ prédictions et à enregistrer les `trade_outcome` qu'il remonte.
 ## Structure
 
 ```
+JOURNAL.md          Journal de bord OPÉRATIONNEL : tout ce qui est câblé autour de la base
+                    (ingestor/backfill/analyseur/bot, déploiement 24/7). Le pendant pratique
+                    de la §10 (qui, elle, garde les décisions). À lire pour la prod.
 db/schema.sql       Source de vérité UNIQUE du schéma (DDL, commentaires inclus).
 db/seed_passthrough.sql  Denylist passthrough permanente (source='seed'), appliquée à l'init.
 src/lib.rs          Déclare les modules db / ingest / analyze + helper now_unix_ms().
