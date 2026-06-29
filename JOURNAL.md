@@ -194,23 +194,30 @@ les RUGS dans `token_outcome`).
 **Ce qui marche** : le brut est alimenté en continu (ingestor + backfill), l'analyseur tourne
 toutes les 5 min et produit clusters/profils, le bot les consomme. Le pipeline est autonome.
 
-**⚠️ LE gap qui rend le modèle de risque INERTE** : `token_outcome` est quasi vide →
-`compute_profile.rug_count = 0` partout → `risk` = prior (0.333) → **aucun rugger détecté**.
+**✅ LE gap est FERMÉ — `token_outcome` est désormais alimenté en temps réel.**
 
-Un premier producteur de `token_outcome` existe désormais (le tracker d'issues écrit
-`price_zero` terminal quand une courbe a pumpé puis s'est effondrée), MAIS il est à **TRÈS
-FAIBLE RECALL** et restera ~0 en pratique. Raison apprise empiriquement : sur pump.fun
-pré-graduation la courbe **GÈLE** à l'abandon (le SOL ne draine pas, personne ne vend) ; un
-vrai **dump de créateur** est **trop rapide** pour un échantillonnage d'état toutes les 10 min.
-→ **L'échantillonnage de courbe est le mauvais outil pour les rugs.**
+Historique : un 1er producteur basé sur l'échantillonnage de courbe (`price_zero` quand une
+courbe pompe puis s'effondre) s'est avéré à **très faible recall** — sur pump.fun la courbe
+**gèle** à l'abandon (le SOL ne draine pas) et un dump est trop rapide pour un sondage 10 min.
+→ l'échantillonnage est le mauvais outil pour les rugs (gardé en best-effort, ~0).
 
-**Le bon producteur de `dev_dumped`** = détecter la **vente du créateur dans le flux
-ShredStream** en temps réel (disc `sell` = sha256("global:sell"), vendeur = un compte de
-l'instruction, à matcher contre le créateur du mint). C'est une **extension de l'ingestor
-Rust** (repo `matbolze/solana-memecoin-ingestor`), rôle FACT-LIKE, à faire. Tant que ce n'est
-pas en place :
-- **Lot 2 (blanchiment lent)** agirait sur des preuves de rug quasi inexistantes → prématuré ;
-- **calibration B2/B6** (eval set) n'a quasi aucun signal rug à calibrer → bloquée.
+**Le BON producteur `dev_dumped`, FAIT et VALIDÉ** : l'ingestor décode dans le flux ShredStream
+la **vente standard pump.fun** (`detect_pumpfun_sells`, disc `sell`=sha256("global:sell"),
+mint=compte[2], vendeur=compte[6], miroir du buy). Dans le writer (hors hot path), il compare
+le vendeur au **créateur connu du mint** (lookup indexé `raw_token_launch.mint`=PK) ; si égal
+→ `record_outcome` **dev_dumped** (terminal, `is_final=false` car pré-confirmation), puis pose
+la **finalité anti-fork B3** (`UPDATE final=1 WHERE observed_slot <= slot-32`, throttlé 1/256
+batches). Rôle FACT-LIKE → frontière respectée. Repo `matbolze/solana-memecoin-ingestor`.
+
+**Mesuré en live** : ~311 ventes standard / 90 s (le `sell` standard est fréquent),
+**~20 `dev_dumped` écrits / 90 s**, finalité OK (19/21 final=1), et l'analyseur compte enfin
+les rugs (`rug_count>0`, un cluster `risk>0.5`). `is_rugger` reste 0 pour les dumpeurs à
+`token_count<3` (garde A3 correcte) → bascule à 1 dès qu'un rugger RÉCURRENT (≥3 tokens) dumpe.
+
+Conséquence : **le modèle de risque n'est plus inerte**. Lot 2 (blanchiment lent) et la
+calibration B2/B6 deviennent possibles (il y a enfin du signal rug à décayer / calibrer).
+Limite connue : les ventes derrière une ALT (v0) ou en variante `sell_v2` ne sont pas
+décodées → recall partiel (suffisant : le signal est abondant).
 
 **Mineurs** : raffiner `gaps` via le leader schedule ; micro-transferts fees/tips (à exclure
 côté passthrough, B2) ; extraction acheteur `buy_v2` si besoin.
@@ -234,5 +241,9 @@ côté passthrough, B2) ; extraction acheteur `buy_v2` si besoin.
 État pipeline 24/7 (vérifié 2026-06-29, ~2 j de run) : ingestor `active` (9.1M slots vus,
 465 manquants = 99.995 %), `raw_token_launch`≈58k, `raw_wallet_flow`≈127k, `cluster`≈14.5k,
 `token_outcome`=0 (cf. §6). Côté gagnant : 18k mints suivis, ~105 graduations, 16 devs élites.
+
+**dev_dumped (côté rug, ingestor)** : décodeur `detect_pumpfun_sells` + câblage coque
+(lookup créateur + record_outcome + finalité B3), commits ingestor `cac7256` (câblage) +
+diag. Validé live : modèle rugger rallumé (`rug_count>0`, `risk>0.5`).
 
 _Dernière mise à jour : 2026-06-29._
