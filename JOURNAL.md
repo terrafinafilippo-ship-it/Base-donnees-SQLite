@@ -63,6 +63,21 @@ Respect strict de la **frontière de propriété** (cf. CLAUDE.md §66) :
 
 ---
 
+### 3bis — Précisions (questions fréquentes)
+
+- **Le bot lit la DB, PAS l'analyseur directement.** Les 3 composants ne se parlent jamais en
+  direct : ils communiquent UNIQUEMENT via ce fichier SQLite. L'analyseur ÉCRIT ses résultats
+  (`cluster_profile`…) dans la base ; le bot les LIT (chargés en RAM via son cache, lecture
+  `PRAGMA query_only=1`). Découplage total → on peut redémarrer/remplacer l'un sans toucher
+  l'autre. Le bot consomme donc « l'analyseur » **à travers la base**.
+
+- **Transport du flux : Jito→proxy = UDP, proxy→ingestor = gRPC.** Les *shreds* bruts arrivent
+  de Jito en paquets **UDP** (multicast). Le `jito-shredstream-proxy` (binaire séparé, sur le
+  VPS) les reçoit, reconstruit les `Entry`, et les re-sert aux abonnés locaux (bot + ingestor)
+  en **gRPC streaming** (`SubscribeEntries`, HTTP/2, `127.0.0.1:9999`). **L'ingestor reçoit du
+  gRPC** ; l'UDP est en amont, dans le proxy. (Inclusion ≠ exécution : ces entries sont
+  pré-confirmation, certaines tx échouent au bloc — voir A1.)
+
 ## 4. Journal chronologique — 2026-06-27
 
 ### 4.1 — Seed passthrough (denylist permanente)
