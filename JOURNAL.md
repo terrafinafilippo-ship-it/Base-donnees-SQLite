@@ -153,13 +153,24 @@ de l'ancienne = `astra-terminal:pre-lot4` pour rollback). Le conteneur de tradin
 été redémarré** (choix prudence : c'est le conteneur live).
 
 ### 5.4 — Côté GAGNANT (hors de cette base — à savoir)
-En parallèle du modèle rugger, un tracker repère les **MEILLEURS devs** (ceux dont les tokens
-**graduent** la bonding curve pump.fun ~85 SOL). Il lit l'état de courbe via `getAccountInfo`
-(parse `complete` + `real_sol_reserves`), agrège par dev, et sortira la whitelist à sniper au
-bloc 0. **Il N'ÉCRIT PAS dans cette base** : ton analyseur compte TOUT `token_outcome`
-terminal comme un RUG ; écrire « graduated » ici flaggerait chaque bon dev en rugger. Le côté
-gagnant vit donc côté bot, dans un store séparé (`outcomes.db`). Mentionné ici pour que tu
-saches qu'il existe et pourquoi il ne touche pas tes tables. **Commit bot `dd4a3ad`.**
+En parallèle du modèle rugger, un tracker repère les **MEILLEURS devs** et les **bons ruggers**
+pour les sniper au bloc 0 (commits bot `dd4a3ad`, `6d1d820`, `3d23abd`, `86bdd6d`). Il lit
+l'état de courbe via `getAccountInfo` (parse `complete`, `real_sol_reserves` → progression, et
+le **market cap** = `vsol×supply/vtoken`), high-water mark par mint dans un store SÉPARÉ
+(`outcomes.db`). Trois catégories, lookup RAM O(1) au t=0 :
+- **ÉLITE** : a gradué (≥85 SOL) → snipe, peut tenir.
+- **BON RUGGER** : atteint un mcap tradeable (~8-10K) de façon répétée même s'il rug → snipe
+  pour un flip rapide (TP, ne pas tenir).
+- garde d'historique (≥3 launches) symétrique de A3.
+
+Résultats réels (24/7 sur ~2 jours) : **18k+ mints suivis, ~105 graduations, 16 devs élites
+détectés** (ex. un dev à 48 launches / 6 graduations). **Bornage volume** : on priorise les
+deployers récurrents (les seuls candidats), pas le firehose.
+
+⚠️ **Pourquoi le côté gagnant N'ÉCRIT (presque) PAS dans cette base** : ton analyseur compte
+TOUT `token_outcome` terminal comme un RUG ; écrire « graduated » ici flaggerait chaque bon
+dev en rugger. Le côté gagnant vit donc côté bot. SEULE exception : voir §6 (le tracker écrit
+les RUGS dans `token_outcome`).
 
 ---
 
@@ -168,13 +179,23 @@ saches qu'il existe et pourquoi il ne touche pas tes tables. **Commit bot `dd4a3
 **Ce qui marche** : le brut est alimenté en continu (ingestor + backfill), l'analyseur tourne
 toutes les 5 min et produit clusters/profils, le bot les consomme. Le pipeline est autonome.
 
-**⚠️ LE gap qui rend le modèle de risque INERTE** : `token_outcome` n'est **écrit par
-personne** → `compute_profile.rug_count = 0` partout → `risk` = prior (0.333) pour tous →
-**aucun rugger n'est jamais détecté**. C'est la priorité avant tout réglage : il faut un
-producteur de `token_outcome` (labels `lp_pulled`/`price_zero`/`dev_dumped`, rôle ingestor
-= FACT-LIKE). Tant que c'est absent :
-- **Lot 2 (blanchiment lent)** agirait sur des preuves de rug inexistantes → prématuré ;
-- **calibration B2/B6** (eval set) n'a aucun signal rug/non-rug à calibrer → bloquée.
+**⚠️ LE gap qui rend le modèle de risque INERTE** : `token_outcome` est quasi vide →
+`compute_profile.rug_count = 0` partout → `risk` = prior (0.333) → **aucun rugger détecté**.
+
+Un premier producteur de `token_outcome` existe désormais (le tracker d'issues écrit
+`price_zero` terminal quand une courbe a pumpé puis s'est effondrée), MAIS il est à **TRÈS
+FAIBLE RECALL** et restera ~0 en pratique. Raison apprise empiriquement : sur pump.fun
+pré-graduation la courbe **GÈLE** à l'abandon (le SOL ne draine pas, personne ne vend) ; un
+vrai **dump de créateur** est **trop rapide** pour un échantillonnage d'état toutes les 10 min.
+→ **L'échantillonnage de courbe est le mauvais outil pour les rugs.**
+
+**Le bon producteur de `dev_dumped`** = détecter la **vente du créateur dans le flux
+ShredStream** en temps réel (disc `sell` = sha256("global:sell"), vendeur = un compte de
+l'instruction, à matcher contre le créateur du mint). C'est une **extension de l'ingestor
+Rust** (repo `matbolze/solana-memecoin-ingestor`), rôle FACT-LIKE, à faire. Tant que ce n'est
+pas en place :
+- **Lot 2 (blanchiment lent)** agirait sur des preuves de rug quasi inexistantes → prématuré ;
+- **calibration B2/B6** (eval set) n'a quasi aucun signal rug à calibrer → bloquée.
 
 **Mineurs** : raffiner `gaps` via le leader schedule ; micro-transferts fees/tips (à exclure
 côté passthrough, B2) ; extraction acheteur `buy_v2` si besoin.
@@ -191,5 +212,12 @@ côté passthrough, B2) ; extraction acheteur `buy_v2` si besoin.
 | bot | `c659ebf` | A2 — cache RAM des profils (lit `cluster_profile`) |
 | bot | `3d429fe` | Lot 4 — backfill `raw_wallet_flow` |
 | bot | `dd4a3ad` | côté gagnant (graduation) — hors de cette base |
+| bot | `6d1d820` | auto-whitelist bons devs → snipe bloc 0 |
+| bot | `3d23abd` | catégorie « bon rugger » (mcap tradeable répété) |
+| bot | `86bdd6d` | bornage volume + détecteur rug best-effort (écrit `token_outcome`) |
 
-_Dernière mise à jour : 2026-06-27._
+État pipeline 24/7 (vérifié 2026-06-29, ~2 j de run) : ingestor `active` (9.1M slots vus,
+465 manquants = 99.995 %), `raw_token_launch`≈58k, `raw_wallet_flow`≈127k, `cluster`≈14.5k,
+`token_outcome`=0 (cf. §6). Côté gagnant : 18k mints suivis, ~105 graduations, 16 devs élites.
+
+_Dernière mise à jour : 2026-06-29._
